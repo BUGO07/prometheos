@@ -5,6 +5,11 @@ use core::arch::asm;
 
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker, request::FramebufferRequest};
 
+mod gdt;
+mod idt;
+mod serial;
+mod utils;
+
 #[used]
 #[unsafe(link_section = ".requests")]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
@@ -23,6 +28,14 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     assert!(BASE_REVISION.is_supported());
+
+    serial::init();
+
+    print!("\x1b[H\x1b[2J"); // clear screen
+    println!("booting");
+
+    gdt::init();
+    idt::init();
 
     if let Some(framebuffer_response) = FRAMEBUFFER_REQUEST.response()
         && let Some(framebuffer) = framebuffer_response.framebuffers().iter().next()
@@ -43,7 +56,8 @@ extern "C" fn kmain() -> ! {
 }
 
 #[panic_handler]
-fn rust_panic(_info: &core::panic::PanicInfo) -> ! {
+fn rust_panic(info: &core::panic::PanicInfo) -> ! {
+    println!("kernel panic: {}", info);
     hcf();
 }
 
