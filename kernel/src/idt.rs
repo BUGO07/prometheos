@@ -1,10 +1,11 @@
 core::arch::global_asm!(include_str!("isr.S"));
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use x86::{
     Ring,
     bits64::segmentation::Descriptor64,
+    controlregs,
     debugregs::{Dr6, dr6_write},
     dtables::{DescriptorTablePointer, lidt},
     segmentation::{BuildDescriptor, DescriptorBuilder, GateDescriptorBuilder, SegmentSelector},
@@ -55,6 +56,15 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) {
         3 => {
             println!("{}: {:#x?}", x86::irq::EXCEPTIONS[vec], frame);
         }
+        14 => {
+            let cr2 = unsafe { controlregs::cr2() };
+            panic!(
+                "{} at cr2={:#x}: {:#x?}",
+                x86::irq::EXCEPTIONS[vec],
+                cr2,
+                frame
+            );
+        }
         4..32 => {
             panic!("{}: {:#x?}", x86::irq::EXCEPTIONS[vec], frame);
         }
@@ -63,7 +73,7 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) {
         }
         _ => {
             let ptr = HANDLERS[vec].load(Ordering::Acquire);
-            if ptr.is_null() {
+            if ptr == 0 {
                 println!("unhandled interrupt: {:#x?}", frame);
             } else {
                 let handler: fn(&mut InterruptFrame) = unsafe { core::mem::transmute(ptr) };
@@ -74,12 +84,12 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) {
 }
 
 static IDT: Singleton<[Descriptor64; 256]> = Singleton::new();
-static HANDLERS: [AtomicPtr<()>; 256] = [const { AtomicPtr::new(core::ptr::null_mut()) }; 256];
+static HANDLERS: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
 
 const DOUBLE_FAULT_IST: u8 = 1;
 
 pub fn init() {
-    println!("initializing");
+    println!("init");
     let mut idt = [Descriptor64::NULL; 256];
     for i in 0..256 {
         idt[i] = <DescriptorBuilder as GateDescriptorBuilder<u64>>::interrupt_descriptor(
@@ -93,15 +103,15 @@ pub fn init() {
     }
     IDT.install(idt);
     let idt_ptr = IDT.with(|idt| DescriptorTablePointer::new(idt));
-    println!("loading");
+    println!("lidt");
     unsafe { lidt(&idt_ptr) };
-    println!("initialized");
+    println!("done");
 }
 
 pub fn install_handler(vector: u8, handler: fn(&mut InterruptFrame)) {
-    HANDLERS[vector as usize].store(handler as *const () as *mut (), Ordering::Release);
+    HANDLERS[vector as usize].store(handler as usize, Ordering::Release);
 }
 
 pub fn clear_handler(vector: u8) {
-    HANDLERS[vector as usize].store(core::ptr::null_mut(), Ordering::Release);
+    HANDLERS[vector as usize].store(0, Ordering::Release);
 }

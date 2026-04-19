@@ -7,6 +7,7 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker, request::Fram
 
 mod gdt;
 mod idt;
+mod mm;
 mod serial;
 mod utils;
 
@@ -21,6 +22,7 @@ static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
 static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
+
 #[used]
 #[unsafe(link_section = ".requests_end_marker")]
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
@@ -37,8 +39,11 @@ extern "C" fn kmain() -> ! {
     gdt::init();
     idt::init();
 
-    if let Some(framebuffer_response) = FRAMEBUFFER_REQUEST.response()
-        && let Some(framebuffer) = framebuffer_response.framebuffers().iter().next()
+    mm::init();
+
+    if let Some(framebuffer) = FRAMEBUFFER_REQUEST
+        .response()
+        .and_then(|res| res.framebuffers().first())
     {
         let fb = unsafe {
             core::slice::from_raw_parts_mut(

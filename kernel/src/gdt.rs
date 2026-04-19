@@ -36,7 +36,7 @@ struct IstStack([u8; IST_STACK_SIZE]);
 static mut DOUBLE_FAULT_STACK: IstStack = IstStack([0; IST_STACK_SIZE]);
 
 pub fn init() {
-    println!("initializing");
+    println!("init");
     let mut tss = TaskStateSegment::default();
     let stack_bottom = &raw mut DOUBLE_FAULT_STACK as u64;
     let stack_top = stack_bottom + IST_STACK_SIZE as u64;
@@ -99,7 +99,7 @@ pub fn init() {
     GDT.install(gdt);
     let gdt_ptr = GDT.with(|gdt| DescriptorTablePointer::new(gdt));
     unsafe {
-        println!("loading gdt");
+        println!("lgdt");
         lgdt(&gdt_ptr);
         load_cs(SegmentSelector::new(1, Ring::Ring0));
         load_ss(SegmentSelector::new(2, Ring::Ring0));
@@ -109,8 +109,8 @@ pub fn init() {
         load_fs(null);
         load_gs(null);
 
-        println!("loading tss");
+        println!("ltr");
         load_tr(SegmentSelector::new(6, Ring::Ring0));
     }
-    println!("initialized");
+    println!("done");
 }
