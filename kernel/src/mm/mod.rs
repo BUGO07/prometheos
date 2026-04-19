@@ -11,6 +11,7 @@ use crate::{
     println,
 };
 
+pub mod heap;
 pub mod pmm;
 pub mod vmm;
 
@@ -98,5 +99,8 @@ pub fn init() {
     let top_level = vmm::take_ownership(hhdm_offset);
     println!("installing vmm ({:#x})", top_level.as_u64());
     VMM.install(Vmm::new(top_level, hhdm_offset));
+
+    println!("setting up heap");
+    heap::init();
     println!("done");
 }

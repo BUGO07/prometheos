@@ -1,6 +1,13 @@
-use core::cell::RefCell;
+use core::{
+    cell::{RefCell, UnsafeCell},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
-use x86::bits64::rflags::RFlags;
+use lock_api::{GuardSend, RawMutex};
+use x86::{
+    current::rflags::{self, RFlags},
+    irq,
+};
 
 pub struct Singleton<T> {
     inner: RefCell<Option<T>>,
@@ -40,12 +47,59 @@ impl<T> Singleton<T> {
     }
 }
 
+pub struct IntLock {
+    locked: AtomicBool,
+    saved_if: UnsafeCell<bool>,
+}
+
+unsafe impl Sync for IntLock {}
+
+unsafe impl RawMutex for IntLock {
+    const INIT: Self = Self {
+        locked: AtomicBool::new(false),
+        saved_if: UnsafeCell::new(false),
+    };
+
+    type GuardMarker = GuardSend;
+
+    fn lock(&self) {
+        while !self.try_lock() {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn try_lock(&self) -> bool {
+        let was_enabled = rflags::read().contains(RFlags::FLAGS_IF);
+        unsafe { irq::disable() };
+        if self.locked.swap(true, Ordering::Acquire) {
+            if was_enabled {
+                unsafe { irq::enable() };
+            }
+            return false;
+        }
+        unsafe { *self.saved_if.get() = was_enabled };
+        true
+    }
+
+    unsafe fn unlock(&self) {
+        let restore = unsafe { *self.saved_if.get() };
+        self.locked.store(false, Ordering::Release);
+        if restore {
+            unsafe { irq::enable() };
+        }
+    }
+
+    fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
+}
+
 pub fn int_free<R>(f: impl FnOnce() -> R) -> R {
-    let enabled = x86::current::rflags::read().contains(RFlags::FLAGS_IF);
-    unsafe { x86::irq::disable() };
+    let enabled = rflags::read().contains(RFlags::FLAGS_IF);
+    unsafe { irq::disable() };
     let res = f();
     if enabled {
-        unsafe { x86::irq::enable() };
+        unsafe { irq::enable() };
     }
     res
 }

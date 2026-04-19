@@ -1,12 +1,13 @@
 use crate::{mm::pmm, utils::Singleton};
 
 use x86::{
-    bits64::paging::{
+    controlregs,
+    current::paging::{
         BASE_PAGE_SIZE, HUGE_PAGE_SIZE, LARGE_PAGE_SIZE, PAGE_SIZE_ENTRIES, PAddr, PD, PDEntry,
         PDFlags, PDPT, PDPTEntry, PDPTFlags, PML4, PML4Entry, PML4Flags, PT, PTEntry, PTFlags,
         VAddr, pd_index, pdpt_index, pml4_index, pt_index,
     },
-    controlregs, tlb,
+    tlb,
 };
 
 pub struct Vmm {
@@ -57,8 +58,8 @@ pub enum UnmapError {
     Misaligned,
 }
 
-fn is_canonical(v: VAddr) -> bool {
-    let hi = v.as_u64() >> 47;
+fn is_canonical(virt: VAddr) -> bool {
+    let hi = virt.as_u64() >> 47;
     hi == 0 || hi == 0x1_ffff
 }
 
@@ -83,58 +84,58 @@ fn pd_parent() -> PDFlags {
     PDFlags::P | PDFlags::RW | PDFlags::US
 }
 
-pub fn translate(v: VAddr) -> Option<(PAddr, PTFlags)> {
-    if !is_canonical(v) {
+pub fn translate(virt: VAddr) -> Option<(PAddr, PTFlags)> {
+    if !is_canonical(virt) {
         return None;
     }
     VMM.with(|vmm| unsafe {
         let hhdm = vmm.hhdm_offset;
 
         let pml4 = table_mut::<PML4>(vmm.top_level, hhdm);
-        let pml4e = (*pml4)[pml4_index(v)];
+        let pml4e = (*pml4)[pml4_index(virt)];
         if !pml4e.is_present() {
             return None;
         }
 
         let pdpt_phys = PAddr(pml4e.address().as_u64());
         let pdpt = table_mut::<PDPT>(pdpt_phys, hhdm);
-        let pdpte = (*pdpt)[pdpt_index(v)];
+        let pdpte = (*pdpt)[pdpt_index(virt)];
         if !pdpte.is_present() {
             return None;
         }
         if pdpte.is_page() {
-            let phys = pdpte.address().as_u64() + (v.as_u64() & (HUGE_PAGE_SIZE as u64 - 1));
+            let phys = pdpte.address().as_u64() + (virt.as_u64() & (HUGE_PAGE_SIZE as u64 - 1));
             return Some((PAddr(phys), PTFlags::from_bits_truncate(pdpte.0)));
         }
 
         let pd_phys = PAddr(pdpte.address().as_u64());
         let pd = table_mut::<PD>(pd_phys, hhdm);
-        let pde = (*pd)[pd_index(v)];
+        let pde = (*pd)[pd_index(virt)];
         if !pde.is_present() {
             return None;
         }
         if pde.is_page() {
-            let phys = pde.address().as_u64() + (v.as_u64() & (LARGE_PAGE_SIZE as u64 - 1));
+            let phys = pde.address().as_u64() + (virt.as_u64() & (LARGE_PAGE_SIZE as u64 - 1));
             return Some((PAddr(phys), PTFlags::from_bits_truncate(pde.0)));
         }
 
         let pt_phys = PAddr(pde.address().as_u64());
         let pt = table_mut::<PT>(pt_phys, hhdm);
-        let pte = (*pt)[pt_index(v)];
+        let pte = (*pt)[pt_index(virt)];
         if !pte.is_present() {
             return None;
         }
-        let phys = pte.address().as_u64() + (v.as_u64() & (BASE_PAGE_SIZE as u64 - 1));
+        let phys = pte.address().as_u64() + (virt.as_u64() & (BASE_PAGE_SIZE as u64 - 1));
         Some((PAddr(phys), pte.flags()))
     })
 }
 
-pub fn map(v: VAddr, p: PAddr, flags: PTFlags, size: PageSize) -> Result<(), MapError> {
-    if !is_canonical(v) {
+pub fn map(virt: VAddr, phys: PAddr, flags: PTFlags, size: PageSize) -> Result<(), MapError> {
+    if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
     }
     let align = size.bytes();
-    if !v.as_u64().is_multiple_of(align) || !p.as_u64().is_multiple_of(align) {
+    if !virt.as_u64().is_multiple_of(align) || !phys.as_u64().is_multiple_of(align) {
         return Err(MapError::Misaligned);
     }
 
@@ -142,7 +143,7 @@ pub fn map(v: VAddr, p: PAddr, flags: PTFlags, size: PageSize) -> Result<(), Map
         let hhdm = vmm.hhdm_offset;
 
         let pml4 = table_mut::<PML4>(vmm.top_level, hhdm);
-        let pml4_slot = &mut (*pml4)[pml4_index(v)];
+        let pml4_slot = &mut (*pml4)[pml4_index(virt)];
         let pdpt_phys = if pml4_slot.is_present() {
             PAddr(pml4_slot.address().as_u64())
         } else {
@@ -153,15 +154,15 @@ pub fn map(v: VAddr, p: PAddr, flags: PTFlags, size: PageSize) -> Result<(), Map
         };
 
         let pdpt = table_mut::<PDPT>(pdpt_phys, hhdm);
-        let pdpt_slot = &mut (*pdpt)[pdpt_index(v)];
+        let pdpt_slot = &mut (*pdpt)[pdpt_index(virt)];
 
         if size == PageSize::Huge {
             if pdpt_slot.is_present() {
                 return Err(MapError::AlreadyMapped);
             }
             let huge = pdpt_leaf(flags);
-            *pdpt_slot = PDPTEntry::new(p, huge);
-            tlb::flush(v.as_u64() as usize);
+            *pdpt_slot = PDPTEntry::new(phys, huge);
+            tlb::flush(virt.as_u64() as usize);
             return Ok(());
         }
 
@@ -178,15 +179,15 @@ pub fn map(v: VAddr, p: PAddr, flags: PTFlags, size: PageSize) -> Result<(), Map
         };
 
         let pd = table_mut::<PD>(pd_phys, hhdm);
-        let pd_slot = &mut (*pd)[pd_index(v)];
+        let pd_slot = &mut (*pd)[pd_index(virt)];
 
         if size == PageSize::Large {
             if pd_slot.is_present() {
                 return Err(MapError::AlreadyMapped);
             }
             let large = pd_leaf(flags);
-            *pd_slot = PDEntry::new(p, large);
-            tlb::flush(v.as_u64() as usize);
+            *pd_slot = PDEntry::new(phys, large);
+            tlb::flush(virt.as_u64() as usize);
             return Ok(());
         }
 
@@ -203,12 +204,12 @@ pub fn map(v: VAddr, p: PAddr, flags: PTFlags, size: PageSize) -> Result<(), Map
         };
 
         let pt = table_mut::<PT>(pt_phys, hhdm);
-        let pt_slot = &mut (*pt)[pt_index(v)];
+        let pt_slot = &mut (*pt)[pt_index(virt)];
         if pt_slot.is_present() {
             return Err(MapError::AlreadyMapped);
         }
-        *pt_slot = PTEntry::new(p, flags | PTFlags::P);
-        tlb::flush(v.as_u64() as usize);
+        *pt_slot = PTEntry::new(phys, flags | PTFlags::P);
+        tlb::flush(virt.as_u64() as usize);
         Ok(())
     })
 }
@@ -232,11 +233,11 @@ fn is_empty(phys: PAddr, hhdm_offset: u64) -> bool {
     unsafe { (*entries).iter().all(|e| (*e) & 1 == 0) }
 }
 
-pub fn unmap(v: VAddr, size: PageSize) -> Result<(), UnmapError> {
-    if !is_canonical(v) {
+pub fn unmap(virt: VAddr, size: PageSize) -> Result<(), UnmapError> {
+    if !is_canonical(virt) {
         return Err(UnmapError::NonCanonical);
     }
-    if !v.as_u64().is_multiple_of(size.bytes()) {
+    if !virt.as_u64().is_multiple_of(size.bytes()) {
         return Err(UnmapError::Misaligned);
     }
 
@@ -244,21 +245,21 @@ pub fn unmap(v: VAddr, size: PageSize) -> Result<(), UnmapError> {
         let hhdm = vmm.hhdm_offset;
 
         let pml4 = table_mut::<PML4>(vmm.top_level, hhdm);
-        let pml4_slot = &mut (*pml4)[pml4_index(v)];
+        let pml4_slot = &mut (*pml4)[pml4_index(virt)];
         if !pml4_slot.is_present() {
             return Err(UnmapError::NotMapped);
         }
         let pdpt_phys = PAddr(pml4_slot.address().as_u64());
 
         let pdpt = table_mut::<PDPT>(pdpt_phys, hhdm);
-        let pdpt_slot = &mut (*pdpt)[pdpt_index(v)];
+        let pdpt_slot = &mut (*pdpt)[pdpt_index(virt)];
 
         if size == PageSize::Huge {
             if !pdpt_slot.is_present() || !pdpt_slot.is_page() {
                 return Err(UnmapError::NotMapped);
             }
             *pdpt_slot = PDPTEntry(0);
-            tlb::flush(v.as_u64() as usize);
+            tlb::flush(virt.as_u64() as usize);
             reclaim_pdpt(pml4_slot, pdpt_phys, hhdm);
             return Ok(());
         }
@@ -269,14 +270,14 @@ pub fn unmap(v: VAddr, size: PageSize) -> Result<(), UnmapError> {
         let pd_phys = PAddr(pdpt_slot.address().as_u64());
 
         let pd = table_mut::<PD>(pd_phys, hhdm);
-        let pd_slot = &mut (*pd)[pd_index(v)];
+        let pd_slot = &mut (*pd)[pd_index(virt)];
 
         if size == PageSize::Large {
             if !pd_slot.is_present() || !pd_slot.is_page() {
                 return Err(UnmapError::NotMapped);
             }
             *pd_slot = PDEntry(0);
-            tlb::flush(v.as_u64() as usize);
+            tlb::flush(virt.as_u64() as usize);
             reclaim_pd(pdpt_slot, pd_phys, hhdm);
             reclaim_pdpt(pml4_slot, pdpt_phys, hhdm);
             return Ok(());
@@ -288,12 +289,12 @@ pub fn unmap(v: VAddr, size: PageSize) -> Result<(), UnmapError> {
         let pt_phys = PAddr(pd_slot.address().as_u64());
 
         let pt = table_mut::<PT>(pt_phys, hhdm);
-        let pt_slot = &mut (*pt)[pt_index(v)];
+        let pt_slot = &mut (*pt)[pt_index(virt)];
         if !pt_slot.is_present() {
             return Err(UnmapError::NotMapped);
         }
         *pt_slot = PTEntry(0);
-        tlb::flush(v.as_u64() as usize);
+        tlb::flush(virt.as_u64() as usize);
         reclaim_pt(pd_slot, pt_phys, hhdm);
         reclaim_pd(pdpt_slot, pd_phys, hhdm);
         reclaim_pdpt(pml4_slot, pdpt_phys, hhdm);
@@ -332,8 +333,8 @@ fn reclaim_pdpt(parent: &mut PML4Entry, pdpt_phys: PAddr, hhdm: u64) {
 }
 
 pub fn map_range(
-    v: VAddr,
-    p: PAddr,
+    virt: VAddr,
+    phys: PAddr,
     pages: u64,
     flags: PTFlags,
     size: PageSize,
@@ -342,14 +343,14 @@ pub fn map_range(
     for i in 0..pages {
         let step = i * stride;
         if let Err(e) = map(
-            VAddr(v.as_u64() + step),
-            PAddr(p.as_u64() + step),
+            VAddr(virt.as_u64() + step),
+            PAddr(phys.as_u64() + step),
             flags,
             size,
         ) {
             for j in 0..i {
                 let back = j * stride;
-                let _ = unmap(VAddr(v.as_u64() + back), size);
+                let _ = unmap(VAddr(virt.as_u64() + back), size);
             }
             return Err(e);
         }
@@ -357,10 +358,10 @@ pub fn map_range(
     Ok(())
 }
 
-pub fn unmap_range(v: VAddr, pages: u64, size: PageSize) -> Result<(), UnmapError> {
+pub fn unmap_range(virt: VAddr, pages: u64, size: PageSize) -> Result<(), UnmapError> {
     let stride = size.bytes();
     for i in 0..pages {
-        unmap(VAddr(v.as_u64() + i * stride), size)?;
+        unmap(VAddr(virt.as_u64() + i * stride), size)?;
     }
     Ok(())
 }

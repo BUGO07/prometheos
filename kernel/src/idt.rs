@@ -3,11 +3,11 @@ core::arch::global_asm!(include_str!("isr.S"));
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use x86::{
-    Ring,
-    bits64::segmentation::Descriptor64,
-    controlregs,
+    Ring, controlregs,
+    current::segmentation::Descriptor64,
     debugregs::{Dr6, dr6_write},
     dtables::{DescriptorTablePointer, lidt},
+    irq,
     segmentation::{BuildDescriptor, DescriptorBuilder, GateDescriptorBuilder, SegmentSelector},
 };
 
@@ -49,24 +49,19 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) {
     let vec = frame.vector as usize;
     match vec {
         1 => {
-            println!("{}: {:#x?}", x86::irq::EXCEPTIONS[vec], frame);
+            println!("{}: {:#x?}", irq::EXCEPTIONS[vec], frame);
             unsafe { dr6_write(Dr6::empty()) };
         }
         2 => {}
         3 => {
-            println!("{}: {:#x?}", x86::irq::EXCEPTIONS[vec], frame);
+            println!("{}: {:#x?}", irq::EXCEPTIONS[vec], frame);
         }
         14 => {
             let cr2 = unsafe { controlregs::cr2() };
-            panic!(
-                "{} at cr2={:#x}: {:#x?}",
-                x86::irq::EXCEPTIONS[vec],
-                cr2,
-                frame
-            );
+            panic!("{} at cr2={:#x}: {:#x?}", irq::EXCEPTIONS[vec], cr2, frame);
         }
         4..32 => {
-            panic!("{}: {:#x?}", x86::irq::EXCEPTIONS[vec], frame);
+            panic!("{}: {:#x?}", irq::EXCEPTIONS[vec], frame);
         }
         0x80 => {
             println!("syscall: {:#x?}", frame);

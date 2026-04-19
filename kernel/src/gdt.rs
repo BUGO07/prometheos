@@ -1,6 +1,6 @@
 use x86::{
     Ring,
-    bits64::segmentation::Descriptor64,
+    current::segmentation::Descriptor64,
     current::task::TaskStateSegment,
     dtables::{DescriptorTablePointer, lgdt},
     segmentation::{
