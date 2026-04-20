@@ -7,6 +7,7 @@ use core::arch::asm;
 
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker, request::FramebufferRequest};
 
+mod acpi;
 mod gdt;
 mod idt;
 mod mm;
@@ -42,6 +43,8 @@ extern "C" fn kmain() -> ! {
     idt::init();
 
     mm::init();
+
+    acpi::init().unwrap();
 
     if let Some(framebuffer) = FRAMEBUFFER_REQUEST
         .response()
