@@ -1,0 +1,3 @@
+[submodule "bindings/uacpi-sys"]
+	path = bindings/uacpi-sys
+	url = https://github.com/BUGO07/uacpi-sys
