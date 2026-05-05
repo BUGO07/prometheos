@@ -29,7 +29,10 @@ run-hdd: run-hdd-$(KARCH)
 run-x86_64: edk2-ovmf $(IMAGE_NAME).iso
 	qemu-system-$(KARCH) \
 		-M q35 \
+		-cpu host,+invtsc \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(KARCH).fd,readonly=on \
+		-boot order=d,menu=on,splash-time=0 \
+		-enable-kvm \
 		-cdrom $(IMAGE_NAME).iso \
 		$(QEMUFLAGS)
 

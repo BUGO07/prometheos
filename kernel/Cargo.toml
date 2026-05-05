@@ -3,6 +3,18 @@ name = "prometheos"
 version = "0.1.0"
 edition = "2024"
 
+[profile.dev]
+opt-level = 1
+lto = "thin"
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+strip = true
+lto = "fat"
+panic = "abort"
+
 [dependencies]
 limine = "0.6.3"
 lock_api = "0.4.14"

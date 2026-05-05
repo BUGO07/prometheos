@@ -8,10 +8,12 @@ use core::arch::asm;
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker, request::FramebufferRequest};
 
 mod acpi;
+mod apic;
 mod gdt;
 mod idt;
 mod mm;
 mod serial;
+mod tsc;
 mod utils;
 
 #[used]
@@ -32,32 +34,36 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
-    assert!(BASE_REVISION.is_supported());
-
     serial::init();
+    assert!(BASE_REVISION.is_supported());
 
     print!("\x1b[H\x1b[2J"); // clear screen
     println!("booting");
 
+    mm::init();
+
     gdt::init();
     idt::init();
 
-    mm::init();
+    tsc::init();
 
     acpi::init().unwrap();
+
+    apic::init();
 
     if let Some(framebuffer) = FRAMEBUFFER_REQUEST
         .response()
         .and_then(|res| res.framebuffers().first())
     {
+        let pitch_pixels = framebuffer.pitch as usize / size_of::<u32>();
         let fb = unsafe {
             core::slice::from_raw_parts_mut(
                 framebuffer.address() as *mut u32,
-                (framebuffer.width * framebuffer.height) as usize,
+                pitch_pixels * framebuffer.height as usize,
             )
         };
         for i in 0..100 {
-            let pixel_offset = i * framebuffer.width as usize + i;
+            let pixel_offset = i * pitch_pixels + i;
             fb[pixel_offset] = 0xFFFFFFFF;
         }
     }

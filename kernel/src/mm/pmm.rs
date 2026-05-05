@@ -39,11 +39,18 @@ impl Bitmap {
     }
 
     fn words(&self) -> &[u64] {
-        unsafe { core::slice::from_raw_parts(self.buf.as_ptr().cast(), self.buf.len() / 8) }
+        unsafe {
+            core::slice::from_raw_parts(self.buf.as_ptr().cast(), self.buf.len() / size_of::<u64>())
+        }
     }
 
     fn words_mut(&mut self) -> &mut [u64] {
-        unsafe { core::slice::from_raw_parts_mut(self.buf.as_mut_ptr().cast(), self.buf.len() / 8) }
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.buf.as_mut_ptr().cast(),
+                self.buf.len() / size_of::<u64>(),
+            )
+        }
     }
 
     pub fn set(&mut self, i: u64) {

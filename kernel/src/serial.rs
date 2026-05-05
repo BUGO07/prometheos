@@ -2,6 +2,8 @@ use core::fmt::{self, Write};
 
 use x86::io::{inb, outb};
 
+use crate::utils::critical_section;
+
 const COM1: u16 = 0x3F8;
 
 #[allow(clippy::identity_op)]
@@ -30,12 +32,14 @@ pub struct Serial;
 
 impl Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
-            if b == b'\n' {
-                write_byte(b'\r');
+        critical_section(|| {
+            for b in s.bytes() {
+                if b == b'\n' {
+                    write_byte(b'\r');
+                }
+                write_byte(b);
             }
-            write_byte(b);
-        }
+        });
         Ok(())
     }
 }

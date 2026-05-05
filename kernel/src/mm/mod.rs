@@ -1,3 +1,5 @@
+use core::sync::atomic::Ordering;
+
 use limine::{
     memmap::MEMMAP_USABLE,
     request::{HhdmRequest, MemmapRequest},
@@ -6,7 +8,7 @@ use limine::{
 use crate::{
     mm::{
         pmm::{Bitmap, FRAME_SHIFT, FRAME_SIZE, PMM, Pmm},
-        vmm::{VMM, Vmm},
+        vmm::{HHDM_OFFSET, VMM, Vmm},
     },
     println,
 };
@@ -26,11 +28,8 @@ static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 pub fn init() {
     println!("init");
 
-    let memmap = MEMMAP_REQUEST
-        .response()
-        .expect("no memmap response")
-        .entries();
-    let hhdm_offset = HHDM_REQUEST.response().expect("no hhdm response").offset;
+    let memmap = MEMMAP_REQUEST.response().unwrap().entries();
+    let hhdm_offset = HHDM_REQUEST.response().unwrap().offset;
 
     println!("hhdm offset = {:#x}", hhdm_offset);
 
@@ -42,7 +41,7 @@ pub fn init() {
         }
     }
 
-    let total_frames = (highest + FRAME_SIZE - 1) >> FRAME_SHIFT;
+    let total_frames = align_up(highest, FRAME_SIZE) >> FRAME_SHIFT;
     let bitmap_bytes = total_frames.div_ceil(8).next_multiple_of(FRAME_SIZE);
 
     println!(
@@ -98,9 +97,22 @@ pub fn init() {
 
     let top_level = vmm::take_ownership(hhdm_offset);
     println!("installing vmm ({:#x})", top_level.as_u64());
-    VMM.install(Vmm::new(top_level, hhdm_offset));
+    HHDM_OFFSET.store(hhdm_offset, Ordering::Relaxed);
+    VMM.install(Vmm::new(top_level));
 
     println!("setting up heap");
     heap::init();
     println!("done");
+}
+
+#[inline(always)]
+pub const fn align_up(addr: u64, align: u64) -> u64 {
+    assert!(align.is_power_of_two());
+    (addr + align - 1) & !(align - 1)
+}
+
+#[inline(always)]
+pub const fn align_down(addr: u64, align: u64) -> u64 {
+    assert!(align.is_power_of_two());
+    addr & !(align - 1)
 }

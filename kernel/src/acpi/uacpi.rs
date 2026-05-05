@@ -1,11 +1,30 @@
 use core::{
+    alloc::Layout,
     ffi::{c_char, c_void},
-    ptr::null_mut,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use x86::current::paging::PAddr;
+use alloc::boxed::Box;
+use lock_api::RawMutex;
+use x86::{
+    bits64::rflags::{self, RFlags},
+    current::paging::{BASE_PAGE_SIZE, PAddr, PTFlags, VAddr},
+    io::{inb, inl, inw, outb, outl, outw},
+    irq,
+};
 
-use crate::{acpi::RSDP_REQUEST, println};
+use crate::{
+    BASE_REVISION,
+    acpi::RSDP_REQUEST,
+    idt::{clear_handler, install_handler, is_handler_installed},
+    mm::{
+        align_down, align_up,
+        vmm::{self, HHDM_OFFSET, MapError, PageSize},
+    },
+    print,
+    tsc::current_time_ns,
+    utils::IntLock,
+};
 
 /// Returns the PHYSICAL address of the RSDP structure via *out_rsdp_address.
 #[unsafe(no_mangle)]
@@ -14,7 +33,15 @@ extern "C" fn uacpi_kernel_get_rsdp(out_rsdp_addr: *mut PAddr) -> uacpi_sys::uac
         return uacpi_sys::UACPI_STATUS_INVALID_ARGUMENT;
     }
     if let Some(response) = RSDP_REQUEST.response() {
-        unsafe { *out_rsdp_addr = PAddr(response.address as u64) };
+        let hhdm = HHDM_OFFSET.load(Ordering::Relaxed);
+        let phys = if let Some(revision) = BASE_REVISION.actual_revision()
+            && revision == 3
+        {
+            response.address as u64
+        } else {
+            (response.address as u64).wrapping_sub(hhdm)
+        };
+        unsafe { *out_rsdp_addr = PAddr(phys) };
         uacpi_sys::UACPI_STATUS_OK
     } else {
         uacpi_sys::UACPI_STATUS_NOT_FOUND
@@ -46,7 +73,22 @@ extern "C" fn uacpi_kernel_get_rsdp(out_rsdp_addr: *mut PAddr) -> uacpi_sys::uac
 ///              to uACPI.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_map(addr: PAddr, len: usize) -> *mut c_void {
-    null_mut()
+    let hhdm = HHDM_OFFSET.load(Ordering::Relaxed);
+    let page = BASE_PAGE_SIZE as u64;
+    let start = align_down(addr.0, page);
+    let end = align_up(addr.0 + len as u64, page);
+    let flags = PTFlags::P | PTFlags::RW | PTFlags::XD | PTFlags::PCD | PTFlags::PWT;
+
+    let mut phys = start;
+    while phys < end {
+        match vmm::map(VAddr(phys + hhdm), PAddr(phys), flags, PageSize::Base) {
+            Ok(()) | Err(MapError::AlreadyMapped) => {}
+            Err(_) => return core::ptr::null_mut(),
+        }
+        phys += page;
+    }
+
+    (addr.0 + hhdm) as _
 }
 
 /// Unmap a virtual memory range at 'addr' with a length of 'len' bytes.
@@ -57,18 +99,18 @@ extern "C" fn uacpi_kernel_map(addr: PAddr, len: usize) -> *mut c_void {
 ///       virtual address originally returned by the VMM for this mapping
 ///       as well as its true length.
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_unmap(addr: *mut c_void, len: usize) {}
+extern "C" fn uacpi_kernel_unmap(_addr: *mut c_void, _len: usize) {}
 
 /// Log a message at the given level.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_log(level: uacpi_sys::uacpi_log_level, msg: *const c_char) {
     if let Ok(s) = unsafe { core::ffi::CStr::from_ptr(msg).to_str() } {
         match level {
-            uacpi_sys::UACPI_LOG_DEBUG | uacpi_sys::UACPI_LOG_TRACE => println!("[debug] {s}"),
-            uacpi_sys::UACPI_LOG_INFO => println!("[info] {s}"),
-            uacpi_sys::UACPI_LOG_WARN => println!("[warning] {s}"),
-            uacpi_sys::UACPI_LOG_ERROR => println!("[error] {s}"),
-            _ => println!("[unknown log level {level}] {s}"),
+            uacpi_sys::UACPI_LOG_DEBUG | uacpi_sys::UACPI_LOG_TRACE => print!("[debug] {s}"),
+            uacpi_sys::UACPI_LOG_INFO => print!("[info] {s}"),
+            uacpi_sys::UACPI_LOG_WARN => print!("[warning] {s}"),
+            uacpi_sys::UACPI_LOG_ERROR => print!("[error] {s}"),
+            _ => print!("[unknown log level {level}] {s}"),
         }
     }
 }
@@ -159,14 +201,15 @@ extern "C" fn uacpi_kernel_pci_write32(
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_io_map(
     base: uacpi_sys::uacpi_io_addr,
-    len: usize,
+    _len: usize,
     out_handle: *mut uacpi_sys::uacpi_handle,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    unsafe { *out_handle = base as _ };
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_io_unmap(handle: uacpi_sys::uacpi_handle) {}
+extern "C" fn uacpi_kernel_io_unmap(_handle: uacpi_sys::uacpi_handle) {}
 
 /// Read the IO range mapped via uacpi_kernel_io_map at a 0-based 'offset'
 /// within the range.
@@ -183,7 +226,8 @@ extern "C" fn uacpi_kernel_io_read8(
     offset: usize,
     out_value: *mut u8,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    unsafe { *out_value = inb(handle as u16 + offset as u16) };
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
@@ -192,7 +236,8 @@ extern "C" fn uacpi_kernel_io_read16(
     offset: usize,
     out_value: *mut u16,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    unsafe { *out_value = inw(handle as u16 + offset as u16) };
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
@@ -201,7 +246,8 @@ extern "C" fn uacpi_kernel_io_read32(
     offset: usize,
     out_value: *mut u32,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    unsafe { *out_value = inl(handle as u16 + offset as u16) };
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 /// Write the IO range mapped via uacpi_kernel_io_map at a 0-based 'offset'
@@ -212,7 +258,8 @@ extern "C" fn uacpi_kernel_io_write8(
     offset: usize,
     in_value: u8,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    unsafe { outb(handle as u16 + offset as u16, in_value) };
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
@@ -221,7 +268,8 @@ extern "C" fn uacpi_kernel_io_write16(
     offset: usize,
     in_value: u16,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    unsafe { outw(handle as u16 + offset as u16, in_value) };
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
@@ -230,18 +278,17 @@ extern "C" fn uacpi_kernel_io_write32(
     offset: usize,
     in_value: u32,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    unsafe { outl(handle as u16 + offset as u16, in_value) };
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 /// Allocate a block of memory of 'size' bytes.
 /// The contents of the allocated memory are unspecified.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_alloc(size: usize) -> *mut c_void {
-    unsafe {
-        alloc::alloc::alloc(
-            alloc::alloc::Layout::from_size_align(size, align_of::<usize>()).unwrap(),
-        ) as *mut c_void
-    }
+    Layout::from_size_align(size.max(1), 16).map_or(core::ptr::null_mut(), |layout| unsafe {
+        alloc::alloc::alloc(layout) as _
+    })
 }
 
 /// Free a previously allocated memory block.
@@ -253,13 +300,10 @@ extern "C" fn uacpi_kernel_alloc(size: usize) -> *mut c_void {
 /// (enabled via UACPI_SIZED_FREES).
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_free(mem: *mut c_void, size_hint: usize) {
-    if !mem.is_null() {
-        unsafe {
-            alloc::alloc::dealloc(
-                mem as *mut u8,
-                alloc::alloc::Layout::from_size_align(size_hint, align_of::<usize>()).unwrap(),
-            );
-        }
+    if !mem.is_null()
+        && let Ok(layout) = Layout::from_size_align(size_hint.max(1), 16)
+    {
+        unsafe { alloc::alloc::dealloc(mem as *mut u8, layout) };
     }
 }
 
@@ -267,43 +311,85 @@ extern "C" fn uacpi_kernel_free(mem: *mut c_void, size_hint: usize) {
 /// strictly monotonic.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_get_nanoseconds_since_boot() -> u64 {
-    0
+    current_time_ns()
 }
 
 /// Spin for N microseconds.
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_stall(usec: u8) {}
+extern "C" fn uacpi_kernel_stall(usec: u8) {
+    let start = current_time_ns();
+    let end = start + usec as u64 * 1000;
+    while current_time_ns() < end {}
+}
 
 /// Sleep for N milliseconds.
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_sleep(msec: u64) {}
+extern "C" fn uacpi_kernel_sleep(msec: u64) {
+    let start = current_time_ns();
+    let end = start + msec * 1000000;
+    while current_time_ns() < end {}
+}
 
+/// TODO:
 /// Create an opaque non-recursive kernel mutex object.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_create_mutex() -> uacpi_sys::uacpi_handle {
-    null_mut()
+    uacpi_kernel_create_spinlock()
 }
 
 /// Free an opaque non-recursive kernel mutex object.
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_free_mutex(handle: uacpi_sys::uacpi_handle) {}
+extern "C" fn uacpi_kernel_free_mutex(handle: uacpi_sys::uacpi_handle) {
+    uacpi_kernel_free_spinlock(handle);
+}
+
+#[derive(Default)]
+struct SimpleEvent {
+    counter: AtomicUsize,
+}
+
+impl SimpleEvent {
+    fn decrement(&self) -> bool {
+        loop {
+            let value = self.counter.load(Ordering::Acquire);
+            if value == 0 {
+                return false;
+            }
+            match self.counter.compare_exchange(
+                value,
+                value - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(v) if v != 0 => return true,
+                Ok(_) => return false,
+                Err(_) => continue,
+            }
+        }
+    }
+}
 
 /// Create an opaque kernel (semaphore-like) event object.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_create_event() -> uacpi_sys::uacpi_handle {
-    null_mut()
+    let event = Box::new(SimpleEvent::default());
+    Box::into_raw(event) as _
 }
 
 /// Free an opaque kernel (semaphore-like) event object.
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_free_event(handle: uacpi_sys::uacpi_handle) {}
+extern "C" fn uacpi_kernel_free_event(handle: uacpi_sys::uacpi_handle) {
+    if !handle.is_null() {
+        let _ = unsafe { Box::from_raw(handle as *mut SimpleEvent) };
+    }
+}
 
 /// Returns a unique identifier of the currently executing thread.
 ///
 /// The returned thread id cannot be UACPI_THREAD_ID_NONE.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_get_thread_id() -> uacpi_sys::uacpi_thread_id {
-    null_mut()
+    0 as _
 }
 
 /// Disable interrupts and return a kernel-defined value representing the
@@ -315,13 +401,19 @@ extern "C" fn uacpi_kernel_get_thread_id() -> uacpi_sys::uacpi_thread_id {
 /// instruction on x86, 'msr daifset, #3' on aarch64 etc.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_disable_interrupts() -> uacpi_sys::uacpi_interrupt_state {
-    0
+    let enabled = rflags::read().contains(RFlags::FLAGS_IF);
+    unsafe { irq::disable() };
+    enabled as _
 }
 
 /// Restore the state of the interrupt flags to the kernel-defined value
 /// provided in 'state'.
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_restore_interrupts(state: uacpi_sys::uacpi_interrupt_state) {}
+extern "C" fn uacpi_kernel_restore_interrupts(state: uacpi_sys::uacpi_interrupt_state) {
+    if state != 0 {
+        unsafe { irq::enable() };
+    }
+}
 
 /// Try to acquire the mutex with a millisecond timeout.
 ///
@@ -334,19 +426,46 @@ extern "C" fn uacpi_kernel_restore_interrupts(state: uacpi_sys::uacpi_interrupt_
 /// The following are possible return values:
 /// 1. UACPI_STATUS_OK - successful acquire operation
 /// 2. UACPI_STATUS_TIMEOUT - timeout reached while attempting to acquire (or
-///                           the single attempt to acquire was not successful
-///                           for calls with timeout=0)
+///    the single attempt to acquire was not successful
+///    for calls with timeout=0)
 /// 3. Any other value - signifies a host internal error and is treated as such
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_acquire_mutex(
     handle: uacpi_sys::uacpi_handle,
     timeout: u16,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    let mutex = unsafe { &*(handle as *const IntLock) };
+    let mut locked = false;
+
+    match timeout {
+        0xFFFF => {
+            mutex.lock();
+            return uacpi_sys::UACPI_STATUS_OK;
+        }
+        0x0000 => locked = mutex.try_lock(),
+        _ => {
+            let time = current_time_ns();
+            while current_time_ns() < time + timeout as u64 * 1_000_000 {
+                locked = mutex.try_lock();
+                if locked {
+                    break;
+                }
+                uacpi_kernel_sleep(1);
+            }
+        }
+    }
+
+    if locked {
+        uacpi_sys::UACPI_STATUS_OK
+    } else {
+        uacpi_sys::UACPI_STATUS_TIMEOUT
+    }
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_release_mutex(handle: uacpi_sys::uacpi_handle) {}
+extern "C" fn uacpi_kernel_release_mutex(handle: uacpi_sys::uacpi_handle) {
+    unsafe { (*(handle as *const IntLock)).unlock() };
+}
 
 /// Try to wait for an event (counter > 0) with a millisecond timeout.
 /// A timeout value of 0xFFFF implies infinite wait.
@@ -359,25 +478,47 @@ extern "C" fn uacpi_kernel_wait_for_event(
     handle: uacpi_sys::uacpi_handle,
     timeout: u16,
 ) -> uacpi_sys::uacpi_bool {
-    false
+    let event = unsafe { &*(handle as *const SimpleEvent) };
+    if timeout == 0xFFFF {
+        while !event.decrement() {
+            uacpi_kernel_sleep(10);
+        }
+        true
+    } else {
+        let mut remaining = timeout as i64;
+        while !event.decrement() {
+            if remaining <= 0 {
+                return false;
+            }
+            uacpi_kernel_sleep(10);
+            remaining -= 10;
+        }
+        true
+    }
 }
 
 /// Signal the event object by incrementing its internal counter by 1.
 ///
 /// This function may be used in interrupt contexts.
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_signal_event(handle: uacpi_sys::uacpi_handle) {}
+extern "C" fn uacpi_kernel_signal_event(handle: uacpi_sys::uacpi_handle) {
+    let event = unsafe { &*(handle as *const SimpleEvent) };
+    event.counter.fetch_add(1, Ordering::AcqRel);
+}
 
 /// Reset the event counter to 0.
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_reset_event(handle: uacpi_sys::uacpi_handle) {}
+extern "C" fn uacpi_kernel_reset_event(handle: uacpi_sys::uacpi_handle) {
+    let event = unsafe { &*(handle as *const SimpleEvent) };
+    event.counter.store(0, Ordering::Release);
+}
 
 /// Handle a firmware request.
 ///
 /// Currently either a Breakpoint or Fatal operators.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_handle_firmware_request(
-    req: *mut uacpi_sys::uacpi_firmware_request,
+    _req: *mut uacpi_sys::uacpi_firmware_request,
 ) -> uacpi_sys::uacpi_status {
     uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
 }
@@ -394,17 +535,40 @@ extern "C" fn uacpi_kernel_install_interrupt_handler(
     ctx: uacpi_sys::uacpi_handle,
     out_irq_handle: *mut uacpi_sys::uacpi_handle,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    let vector = if cfg!(target_arch = "x86_64") {
+        irq + 0x20
+    } else {
+        irq
+    } as u8;
+
+    if is_handler_installed(vector) {
+        return uacpi_sys::UACPI_STATUS_ALREADY_EXISTS;
+    }
+
+    let ctx = ctx as usize;
+    install_handler(vector, move |_| {
+        if let Some(handler) = handler.as_ref() {
+            unsafe { handler(ctx as _) };
+        }
+    });
+
+    unsafe { *out_irq_handle = vector as _ };
+
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 /// Uninstall an interrupt handler. 'irq_handle' is the value returned via
 /// 'out_irq_handle' during installation.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_uninstall_interrupt_handler(
-    handler: uacpi_sys::uacpi_interrupt_handler,
+    _handler: uacpi_sys::uacpi_interrupt_handler,
     irq_handle: uacpi_sys::uacpi_handle,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    let vector = irq_handle as u8;
+
+    clear_handler(vector);
+
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 /// Create a kernel spinlock object.
@@ -412,12 +576,17 @@ extern "C" fn uacpi_kernel_uninstall_interrupt_handler(
 /// Unlike other types of locks, spinlocks may be used in interrupt contexts.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_create_spinlock() -> uacpi_sys::uacpi_handle {
-    null_mut()
+    let lock = Box::new(IntLock::INIT);
+    Box::into_raw(lock) as _
 }
 
 /// Free a kernel spinlock object.
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_free_spinlock(handle: uacpi_sys::uacpi_handle) {}
+extern "C" fn uacpi_kernel_free_spinlock(handle: uacpi_sys::uacpi_handle) {
+    if !handle.is_null() {
+        let _ = unsafe { Box::from_raw(handle as *mut IntLock) };
+    }
+}
 
 /// Lock a spinlock.
 ///
@@ -430,6 +599,11 @@ extern "C" fn uacpi_kernel_free_spinlock(handle: uacpi_sys::uacpi_handle) {}
 extern "C" fn uacpi_kernel_lock_spinlock(
     handle: uacpi_sys::uacpi_handle,
 ) -> uacpi_sys::uacpi_cpu_flags {
+    if handle.is_null() {
+        return 0;
+    }
+    let lock = unsafe { &*(handle as *const IntLock) };
+    lock.lock();
     0
 }
 
@@ -437,17 +611,22 @@ extern "C" fn uacpi_kernel_lock_spinlock(
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_unlock_spinlock(
     handle: uacpi_sys::uacpi_handle,
-    flags: uacpi_sys::uacpi_cpu_flags,
+    _flags: uacpi_sys::uacpi_cpu_flags,
 ) {
+    if handle.is_null() {
+        return;
+    }
+    let lock = unsafe { &*(handle as *const IntLock) };
+    unsafe { lock.unlock() };
 }
 
 /// Schedules deferred work for execution.
 /// Might be invoked from an interrupt context.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_schedule_work(
-    work_type: uacpi_sys::uacpi_work_type,
-    handler: uacpi_sys::uacpi_work_handler,
-    ctx: uacpi_sys::uacpi_handle,
+    _work_type: uacpi_sys::uacpi_work_type,
+    _handler: uacpi_sys::uacpi_work_handler,
+    _ctx: uacpi_sys::uacpi_handle,
 ) -> uacpi_sys::uacpi_status {
     uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
 }

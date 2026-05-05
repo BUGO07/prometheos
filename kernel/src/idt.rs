@@ -1,7 +1,7 @@
 core::arch::global_asm!(include_str!("isr.S"));
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-
+use alloc::boxed::Box;
+use lock_api::{Mutex, RawMutex};
 use x86::{
     Ring, controlregs,
     current::segmentation::Descriptor64,
@@ -11,7 +11,10 @@ use x86::{
     segmentation::{BuildDescriptor, DescriptorBuilder, GateDescriptorBuilder, SegmentSelector},
 };
 
-use crate::{println, utils::Singleton};
+use crate::{
+    println,
+    utils::{IntLock, Singleton},
+};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -50,7 +53,7 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) {
     match vec {
         1 => {
             println!("{}: {:#x?}", irq::EXCEPTIONS[vec], frame);
-            unsafe { dr6_write(Dr6::empty()) };
+            unsafe { dr6_write(Dr6::from_bits_truncate(0xFFFF_0FF0)) };
         }
         2 => {}
         3 => {
@@ -60,26 +63,28 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) {
             let cr2 = unsafe { controlregs::cr2() };
             panic!("{} at cr2={:#x}: {:#x?}", irq::EXCEPTIONS[vec], cr2, frame);
         }
-        4..32 => {
+        0 | 4..32 => {
             panic!("{}: {:#x?}", irq::EXCEPTIONS[vec], frame);
         }
         0x80 => {
             println!("syscall: {:#x?}", frame);
         }
         _ => {
-            let ptr = HANDLERS[vec].load(Ordering::Acquire);
-            if ptr == 0 {
-                println!("unhandled interrupt: {:#x?}", frame);
-            } else {
-                let handler: fn(&mut InterruptFrame) = unsafe { core::mem::transmute(ptr) };
+            let mut slot = HANDLERS[vec].lock();
+            if let Some(handler) = slot.as_mut() {
                 handler(frame);
+            } else {
+                println!("unhandled interrupt: {:#x?}", frame);
             }
         }
     }
 }
 
+type Handler = Box<dyn FnMut(&mut InterruptFrame) + Send>;
+
 static IDT: Singleton<[Descriptor64; 256]> = Singleton::new();
-static HANDLERS: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
+static HANDLERS: [Mutex<IntLock, Option<Handler>>; 256] =
+    [const { Mutex::const_new(IntLock::INIT, None) }; 256];
 
 const DOUBLE_FAULT_IST: u8 = 1;
 
@@ -103,10 +108,18 @@ pub fn init() {
     println!("done");
 }
 
-pub fn install_handler(vector: u8, handler: fn(&mut InterruptFrame)) {
-    HANDLERS[vector as usize].store(handler as usize, Ordering::Release);
+pub fn is_handler_installed(vector: u8) -> bool {
+    HANDLERS[vector as usize].lock().is_some()
+}
+
+pub fn install_handler<F>(vector: u8, handler: F)
+where
+    F: FnMut(&mut InterruptFrame) + Send + 'static,
+{
+    let handler: Handler = Box::new(handler);
+    *HANDLERS[vector as usize].lock() = Some(handler);
 }
 
 pub fn clear_handler(vector: u8) {
-    HANDLERS[vector as usize].store(0, Ordering::Release);
+    *HANDLERS[vector as usize].lock() = None;
 }

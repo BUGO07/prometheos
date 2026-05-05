@@ -15,14 +15,13 @@ pub mod uacpi;
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 pub fn status_to_result(status: uacpi_sys::uacpi_status) -> Result<(), &'static str> {
-    if status != uacpi_sys::UACPI_STATUS_OK {
-        Ok(())
-    } else {
-        Err(unsafe {
+    match status {
+        uacpi_sys::UACPI_STATUS_OK => Ok(()),
+        _ => Err(unsafe {
             CStr::from_ptr(uacpi_status_to_string(status))
                 .to_str()
                 .unwrap_or("Unknown error")
-        })
+        }),
     }
 }
 
