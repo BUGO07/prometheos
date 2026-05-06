@@ -21,7 +21,8 @@ use crate::{
         align_down, align_up,
         vmm::{self, HHDM_OFFSET, MapError, PageSize},
     },
-    print,
+    pci::{PciAddress, pci_read, pci_write},
+    print, println,
     tsc::current_time_ns,
     utils::IntLock,
 };
@@ -75,11 +76,10 @@ extern "C" fn uacpi_kernel_get_rsdp(out_rsdp_addr: *mut PAddr) -> uacpi_sys::uac
 extern "C" fn uacpi_kernel_map(addr: PAddr, len: usize) -> *mut c_void {
     let hhdm = HHDM_OFFSET.load(Ordering::Relaxed);
     let page = BASE_PAGE_SIZE as u64;
-    let start = align_down(addr.0, page);
+    let mut phys = align_down(addr.0, page);
     let end = align_up(addr.0 + len as u64, page);
     let flags = PTFlags::P | PTFlags::RW | PTFlags::XD | PTFlags::PCD | PTFlags::PWT;
 
-    let mut phys = start;
     while phys < end {
         match vmm::map(VAddr(phys + hhdm), PAddr(phys), flags, PageSize::Base) {
             Ok(()) | Err(MapError::AlreadyMapped) => {}
@@ -99,7 +99,18 @@ extern "C" fn uacpi_kernel_map(addr: PAddr, len: usize) -> *mut c_void {
 ///       virtual address originally returned by the VMM for this mapping
 ///       as well as its true length.
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_unmap(_addr: *mut c_void, _len: usize) {}
+extern "C" fn uacpi_kernel_unmap(addr: VAddr, len: usize) {
+    let page = BASE_PAGE_SIZE as u64;
+    let mut virt = align_down(addr.0, page);
+    let end = align_up(addr.0 + len as u64, page);
+
+    while virt < end {
+        if let Err(e) = vmm::unmap(VAddr(virt), PageSize::Base) {
+            println!("failed to unmap {virt:#x}: {e:?}");
+        }
+        virt += page;
+    }
+}
 
 /// Log a message at the given level.
 #[unsafe(no_mangle)]
@@ -130,11 +141,21 @@ extern "C" fn uacpi_kernel_pci_device_open(
     address: uacpi_sys::uacpi_pci_address,
     out_handle: *mut uacpi_sys::uacpi_handle,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    let addr = PciAddress {
+        bus: address.bus,
+        device: address.device,
+        function: address.function,
+    };
+    unsafe { *out_handle = Box::into_raw(Box::new(addr)) as _ };
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn uacpi_kernel_pci_device_close(handle: uacpi_sys::uacpi_handle) {}
+extern "C" fn uacpi_kernel_pci_device_close(handle: uacpi_sys::uacpi_handle) {
+    if !handle.is_null() {
+        let _ = unsafe { Box::from_raw(handle as *mut PciAddress) };
+    }
+}
 
 /// Read the configuration space of a previously open PCI device.
 #[unsafe(no_mangle)]
@@ -143,7 +164,8 @@ extern "C" fn uacpi_kernel_pci_read8(
     offset: usize,
     value: *mut u8,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    unsafe { *value = pci_read(*(device as *const PciAddress), offset) };
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
@@ -152,7 +174,8 @@ extern "C" fn uacpi_kernel_pci_read16(
     offset: usize,
     value: *mut u16,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    unsafe { *value = pci_read(*(device as *const PciAddress), offset) };
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
@@ -161,7 +184,8 @@ extern "C" fn uacpi_kernel_pci_read32(
     offset: usize,
     value: *mut u32,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    unsafe { *value = pci_read(*(device as *const PciAddress), offset) };
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 /// Write the configuration space of a previously open PCI device.
@@ -171,7 +195,8 @@ extern "C" fn uacpi_kernel_pci_write8(
     offset: usize,
     value: u8,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    pci_write(unsafe { *(device as *const PciAddress) }, offset, value);
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
@@ -180,7 +205,8 @@ extern "C" fn uacpi_kernel_pci_write16(
     offset: usize,
     value: u16,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    pci_write(unsafe { *(device as *const PciAddress) }, offset, value);
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
@@ -189,7 +215,8 @@ extern "C" fn uacpi_kernel_pci_write32(
     offset: usize,
     value: u32,
 ) -> uacpi_sys::uacpi_status {
-    uacpi_sys::UACPI_STATUS_UNIMPLEMENTED
+    pci_write(unsafe { *(device as *const PciAddress) }, offset, value);
+    uacpi_sys::UACPI_STATUS_OK
 }
 
 /// Map a SystemIO address at [base, base + len) and return a kernel-implemented

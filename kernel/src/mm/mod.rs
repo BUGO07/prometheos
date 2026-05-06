@@ -25,7 +25,14 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[unsafe(link_section = ".requests")]
 static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 
-pub fn init() {
+#[derive(Debug)]
+pub enum MmError {
+    VmmError(vmm::VmmError),
+    #[allow(dead_code)]
+    HeapError(heap::HeapError),
+}
+
+pub fn init() -> Result<(), MmError> {
     println!("init");
 
     let memmap = MEMMAP_REQUEST.response().unwrap().entries();
@@ -95,14 +102,16 @@ pub fn init() {
         free_frames * FRAME_SIZE / 1024 / 1024
     );
 
-    let top_level = vmm::take_ownership(hhdm_offset);
+    let top_level = vmm::take_ownership(hhdm_offset).map_err(MmError::VmmError)?;
     println!("installing vmm ({:#x})", top_level.as_u64());
     HHDM_OFFSET.store(hhdm_offset, Ordering::Relaxed);
     VMM.install(Vmm::new(top_level));
 
     println!("setting up heap");
-    heap::init();
+    heap::init().map_err(MmError::HeapError)?;
     println!("done");
+
+    Ok(())
 }
 
 #[inline(always)]

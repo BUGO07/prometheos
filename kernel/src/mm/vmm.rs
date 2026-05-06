@@ -29,7 +29,7 @@ impl PageSize {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum MapError {
     AlreadyMapped,
     OutOfMemory,
@@ -37,7 +37,7 @@ pub enum MapError {
     Misaligned,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum UnmapError {
     NotMapped,
     NonCanonical,
@@ -483,12 +483,16 @@ fn free_cloned_table(phys: PAddr, hhdm: u64, level: u8) {
     pmm::free_frame(phys);
 }
 
-pub fn take_ownership(hhdm_offset: u64) -> PAddr {
+#[derive(Debug)]
+pub enum VmmError {
+    OutOfFrames,
+}
+
+pub fn take_ownership(hhdm_offset: u64) -> Result<PAddr, VmmError> {
     let old_cr3 = unsafe { controlregs::cr3() };
     let old_pml4 = PAddr(old_cr3 & ENTRY_ADDR_MASK);
-    let new_pml4 = clone_table(old_pml4, hhdm_offset, 3)
-        .expect("clone_table: out of frames during take_ownership");
+    let new_pml4 = clone_table(old_pml4, hhdm_offset, 3).ok_or(VmmError::OutOfFrames)?;
     let new_cr3 = (new_pml4.as_u64() & ENTRY_ADDR_MASK) | (old_cr3 & !ENTRY_ADDR_MASK);
     unsafe { controlregs::cr3_write(new_cr3) };
-    new_pml4
+    Ok(new_pml4)
 }

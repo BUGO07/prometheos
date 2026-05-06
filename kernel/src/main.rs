@@ -12,6 +12,7 @@ mod apic;
 mod gdt;
 mod idt;
 mod mm;
+mod pci;
 mod serial;
 mod tsc;
 mod utils;
@@ -40,16 +41,15 @@ extern "C" fn kmain() -> ! {
     print!("\x1b[H\x1b[2J"); // clear screen
     println!("booting");
 
-    mm::init();
+    mm::init().unwrap();
 
     gdt::init();
     idt::init();
 
-    tsc::init();
-
+    tsc::init().unwrap();
     acpi::init().unwrap();
-
-    apic::init();
+    apic::init().unwrap();
+    pci::init().unwrap();
 
     if let Some(framebuffer) = FRAMEBUFFER_REQUEST
         .response()

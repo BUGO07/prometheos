@@ -10,7 +10,7 @@ use x86::current::paging::{BASE_PAGE_SIZE, PTFlags, VAddr};
 use crate::{
     mm::{
         pmm,
-        vmm::{self, PageSize},
+        vmm::{self, MapError, PageSize},
     },
     utils::IntLock,
 };
@@ -23,12 +23,23 @@ pub const GROW_CHUNK: usize = 4 * 1024 * 1024;
 #[global_allocator]
 static ALLOCATOR: TalcLock<IntLock, HeapSource> = TalcLock::new(HeapSource::new());
 
-pub fn init() {
-    map_range(HEAP_BASE, INITIAL_HEAP_SIZE).unwrap();
+#[derive(Debug)]
+pub enum HeapError {
+    #[allow(dead_code)]
+    CouldNotMap(MapError),
+    CouldNotClaim,
+}
+
+pub fn init() -> Result<(), HeapError> {
+    map_range(HEAP_BASE, INITIAL_HEAP_SIZE).map_err(HeapError::CouldNotMap)?;
 
     let mut talc = ALLOCATOR.lock();
-    let end = unsafe { talc.claim(HEAP_BASE as *mut u8, INITIAL_HEAP_SIZE).unwrap() };
+    let end = unsafe {
+        talc.claim(HEAP_BASE as *mut u8, INITIAL_HEAP_SIZE)
+            .ok_or(HeapError::CouldNotClaim)?
+    };
     talc.source.heap_end = Some(end);
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -62,7 +73,7 @@ unsafe impl Source for HeapSource {
             return Err(());
         }
 
-        map_range(start, grow)?;
+        map_range(start, grow).map_err(|_| ())?;
 
         let new_end = end as *mut u8;
         let updated = unsafe { talc.extend(heap_end, new_end) };
@@ -85,24 +96,22 @@ fn rollback(start: usize, mapped: usize) {
     }
 }
 
-fn map_range(start: usize, size: usize) -> Result<(), ()> {
+fn map_range(start: usize, size: usize) -> Result<(), MapError> {
     let mut mapped = 0usize;
     while mapped < size {
         let Some(frame) = pmm::alloc_frame() else {
             rollback(start, mapped);
-            return Err(());
+            return Err(MapError::OutOfMemory);
         };
-        if vmm::map(
+        if let Err(e) = vmm::map(
             VAddr::from_usize(start + mapped),
             frame,
             PTFlags::RW | PTFlags::XD,
             PageSize::Base,
-        )
-        .is_err()
-        {
+        ) {
             pmm::free_frame(frame);
             rollback(start, mapped);
-            return Err(());
+            return Err(e);
         }
         mapped += BASE_PAGE_SIZE;
     }

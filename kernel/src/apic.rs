@@ -7,11 +7,11 @@ use x86::{
 
 use crate::{
     idt::install_handler,
-    mm::vmm::{self, PageSize},
+    mm::vmm::{self, MapError, PageSize},
     println,
 };
 
-pub fn init() {
+pub fn init() -> Result<(), ApicError> {
     println!("init");
 
     println!("mask legacy pic");
@@ -32,7 +32,7 @@ pub fn init() {
         unsafe { wrmsr(IA32_X2APIC_EOI, 0) };
     });
 
-    let (phys, base_gsi) = find_ioapic().unwrap();
+    let (phys, base_gsi) = find_ioapic()?;
     let kb_gsi = resolve_isa_irq(1);
     assert!(
         kb_gsi >= base_gsi,
@@ -45,26 +45,29 @@ pub fn init() {
         PTFlags::P | PTFlags::RW | PTFlags::XD | PTFlags::PCD | PTFlags::PWT,
         PageSize::Base,
     )
-    .unwrap();
+    .map_err(ApicError::CouldNotMap)?;
     let mut ioapic = unsafe { IoApic::new(virt.as_usize()) };
     ioapic.enable((kb_gsi - base_gsi) as u8, bsp_id as u8);
 
     unsafe { irq::enable() };
     println!("done");
+    Ok(())
 }
 
 #[derive(Debug)]
-enum IoApicError {
+pub enum ApicError {
     AcpiTableNotFound,
-    NotFound,
+    IoApicNotFound,
+    #[allow(dead_code)]
+    CouldNotMap(MapError),
 }
 
-fn find_ioapic() -> Result<(PAddr, u32), IoApicError> {
+fn find_ioapic() -> Result<(PAddr, u32), ApicError> {
     let mut table = uacpi_sys::uacpi_table::default();
     if unsafe { uacpi_sys::uacpi_table_find_by_signature(c"APIC".as_ptr(), &mut table) }
         != uacpi_sys::UACPI_STATUS_OK
     {
-        return Err(IoApicError::AcpiTableNotFound);
+        return Err(ApicError::AcpiTableNotFound);
     }
 
     let mut out = None;
@@ -77,7 +80,7 @@ fn find_ioapic() -> Result<(PAddr, u32), IoApicError> {
         )
     };
     let _ = unsafe { uacpi_sys::uacpi_table_unref(&mut table) };
-    out.ok_or(IoApicError::NotFound)
+    out.ok_or(ApicError::IoApicNotFound)
 }
 
 unsafe extern "C" fn ioapic_cb(

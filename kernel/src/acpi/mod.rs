@@ -14,7 +14,7 @@ pub mod uacpi;
 #[unsafe(link_section = ".requests")]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
-pub fn status_to_result(status: uacpi_sys::uacpi_status) -> Result<(), &'static str> {
+pub fn uacpi_status_to_result(status: uacpi_sys::uacpi_status) -> Result<(), &'static str> {
     match status {
         uacpi_sys::UACPI_STATUS_OK => Ok(()),
         _ => Err(unsafe {
@@ -27,10 +27,10 @@ pub fn status_to_result(status: uacpi_sys::uacpi_status) -> Result<(), &'static 
 
 pub fn init() -> Result<(), &'static str> {
     println!("init");
-    status_to_result(unsafe { uacpi_initialize(0) })?;
-    status_to_result(unsafe { uacpi_namespace_load() })?;
-    status_to_result(unsafe { uacpi_namespace_initialize() })?;
-    status_to_result(unsafe { uacpi_finalize_gpe_initialization() })?;
+    uacpi_status_to_result(unsafe { uacpi_initialize(0) })?;
+    uacpi_status_to_result(unsafe { uacpi_namespace_load() })?;
+    uacpi_status_to_result(unsafe { uacpi_namespace_initialize() })?;
+    uacpi_status_to_result(unsafe { uacpi_finalize_gpe_initialization() })?;
     println!("done");
     Ok(())
 }

@@ -10,19 +10,24 @@ use crate::println;
 
 const PIT_FREQ: u64 = 1_193_182;
 
-static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(0);
+pub static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(0);
 static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
 
-pub fn init() {
+#[derive(Debug)]
+pub enum TscError {
+    NotInvariant,
+}
+
+pub fn init() -> Result<(), TscError> {
     println!("init");
 
     let cpuid = CpuId::new();
-    assert!(
-        cpuid
-            .get_advanced_power_mgmt_info()
-            .is_some_and(|info| info.has_invariant_tsc()),
-        "cpu doesn't have invariant tsc"
-    );
+    if !cpuid
+        .get_advanced_power_mgmt_info()
+        .is_some_and(|info| info.has_invariant_tsc())
+    {
+        return Err(TscError::NotInvariant);
+    }
 
     let freq = cpuid
         .get_tsc_info()
@@ -33,6 +38,7 @@ pub fn init() {
     BOOT_TSC.store(unsafe { rdtsc() }, Ordering::Release);
 
     println!("done ({freq}hz)");
+    Ok(())
 }
 
 fn calibrate_with_pit() -> u64 {

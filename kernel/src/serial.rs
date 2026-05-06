@@ -47,13 +47,13 @@ impl Write for Serial {
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        let _ = core::write!($crate::serial::Serial, $($arg)*);
+        use ::core::fmt::Write;
+        let _ = ::core::write!($crate::serial::Serial, $($arg)*);
     }};
 }
 
 #[macro_export]
 macro_rules! println {
     () => ($crate::print!("\n"));
-    ($($arg:tt)*) => ($crate::print!("{}: {}\n", module_path!().split("::").last().unwrap(), core::format_args!($($arg)*)));
+    ($($arg:tt)*) => ($crate::print!("{}: {}\n", module_path!().split("::").last().unwrap_or("unknown"), ::core::format_args!($($arg)*)));
 }
