@@ -1,5 +1,5 @@
 use core::{
-    alloc::Layout,
+    alloc::{GlobalAlloc, Layout},
     ffi::{c_char, c_void},
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -19,12 +19,13 @@ use crate::{
     idt::{clear_handler, install_handler, is_handler_installed},
     mm::{
         align_down, align_up,
+        heap::ALLOCATOR,
         vmm::{self, HHDM_OFFSET, MapError, PageSize},
     },
     pci::{PciAddress, pci_read, pci_write},
     print, println,
     tsc::current_time_ns,
-    utils::IntLock,
+    utils::SpinLock,
 };
 
 /// Returns the PHYSICAL address of the RSDP structure via *out_rsdp_address.
@@ -313,9 +314,7 @@ extern "C" fn uacpi_kernel_io_write32(
 /// The contents of the allocated memory are unspecified.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_alloc(size: usize) -> *mut c_void {
-    Layout::from_size_align(size.max(1), 16).map_or(core::ptr::null_mut(), |layout| unsafe {
-        alloc::alloc::alloc(layout) as _
-    })
+    unsafe { ALLOCATOR.alloc(Layout::from_size_align_unchecked(size.max(1), 16)) as _ }
 }
 
 /// Free a previously allocated memory block.
@@ -327,10 +326,13 @@ extern "C" fn uacpi_kernel_alloc(size: usize) -> *mut c_void {
 /// (enabled via UACPI_SIZED_FREES).
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_free(mem: *mut c_void, size_hint: usize) {
-    if !mem.is_null()
-        && let Ok(layout) = Layout::from_size_align(size_hint.max(1), 16)
-    {
-        unsafe { alloc::alloc::dealloc(mem as *mut u8, layout) };
+    if !mem.is_null() {
+        unsafe {
+            ALLOCATOR.dealloc(
+                mem as *mut u8,
+                Layout::from_size_align_unchecked(size_hint.max(1), 16),
+            )
+        };
     }
 }
 
@@ -461,7 +463,7 @@ extern "C" fn uacpi_kernel_acquire_mutex(
     handle: uacpi_sys::uacpi_handle,
     timeout: u16,
 ) -> uacpi_sys::uacpi_status {
-    let mutex = unsafe { &*(handle as *const IntLock) };
+    let mutex = unsafe { &*(handle as *const SpinLock) };
     let mut locked = false;
 
     match timeout {
@@ -491,7 +493,7 @@ extern "C" fn uacpi_kernel_acquire_mutex(
 
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_release_mutex(handle: uacpi_sys::uacpi_handle) {
-    unsafe { (*(handle as *const IntLock)).unlock() };
+    unsafe { (*(handle as *const SpinLock)).unlock() };
 }
 
 /// Try to wait for an event (counter > 0) with a millisecond timeout.
@@ -603,7 +605,7 @@ extern "C" fn uacpi_kernel_uninstall_interrupt_handler(
 /// Unlike other types of locks, spinlocks may be used in interrupt contexts.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_create_spinlock() -> uacpi_sys::uacpi_handle {
-    let lock = Box::new(IntLock::INIT);
+    let lock = Box::new(SpinLock::INIT);
     Box::into_raw(lock) as _
 }
 
@@ -611,7 +613,7 @@ extern "C" fn uacpi_kernel_create_spinlock() -> uacpi_sys::uacpi_handle {
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_free_spinlock(handle: uacpi_sys::uacpi_handle) {
     if !handle.is_null() {
-        let _ = unsafe { Box::from_raw(handle as *mut IntLock) };
+        let _ = unsafe { Box::from_raw(handle as *mut SpinLock) };
     }
 }
 
@@ -626,25 +628,25 @@ extern "C" fn uacpi_kernel_free_spinlock(handle: uacpi_sys::uacpi_handle) {
 extern "C" fn uacpi_kernel_lock_spinlock(
     handle: uacpi_sys::uacpi_handle,
 ) -> uacpi_sys::uacpi_cpu_flags {
-    if handle.is_null() {
-        return 0;
+    let state = uacpi_kernel_disable_interrupts();
+    if !handle.is_null() {
+        let lock = unsafe { &*(handle as *const SpinLock) };
+        lock.lock();
     }
-    let lock = unsafe { &*(handle as *const IntLock) };
-    lock.lock();
-    0
+    state
 }
 
 /// Unlock a spinlock, restoring the previous cpu flags state.
 #[unsafe(no_mangle)]
 extern "C" fn uacpi_kernel_unlock_spinlock(
     handle: uacpi_sys::uacpi_handle,
-    _flags: uacpi_sys::uacpi_cpu_flags,
+    flags: uacpi_sys::uacpi_cpu_flags,
 ) {
-    if handle.is_null() {
-        return;
+    if !handle.is_null() {
+        let lock = unsafe { &*(handle as *const SpinLock) };
+        unsafe { lock.unlock() };
     }
-    let lock = unsafe { &*(handle as *const IntLock) };
-    unsafe { lock.unlock() };
+    uacpi_kernel_restore_interrupts(flags);
 }
 
 /// Schedules deferred work for execution.

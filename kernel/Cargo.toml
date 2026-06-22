@@ -16,8 +16,7 @@ lto = "fat"
 panic = "abort"
 
 [dependencies]
-limine = "0.6.3"
+limine = "0.6.5"
 lock_api = "0.4.14"
-talc = "5.0.3"
 uacpi-sys = { path = "../bindings/uacpi-sys" }
 x86 = "0.52.0"

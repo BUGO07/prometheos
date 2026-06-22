@@ -84,6 +84,50 @@ unsafe impl RawMutex for IntLock {
     }
 }
 
+pub struct SpinLock {
+    locked: AtomicBool,
+}
+
+unsafe impl Sync for SpinLock {}
+
+unsafe impl RawMutex for SpinLock {
+    const INIT: Self = Self {
+        locked: AtomicBool::new(false),
+    };
+
+    type GuardMarker = GuardSend;
+
+    #[inline]
+    fn lock(&self) {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    #[inline]
+    fn try_lock(&self) -> bool {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    #[inline]
+    unsafe fn unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+
+    #[inline]
+    fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
+}
+
 pub fn critical_section<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,

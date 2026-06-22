@@ -7,7 +7,7 @@ use limine::{
 
 use crate::{
     mm::{
-        pmm::{Bitmap, FRAME_SHIFT, FRAME_SIZE, PMM, Pmm},
+        pmm::{FRAME_SHIFT, FRAME_SIZE, Pmm},
         vmm::{HHDM_OFFSET, VMM, Vmm},
     },
     println,
@@ -28,7 +28,6 @@ static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 #[derive(Debug)]
 pub enum MmError {
     VmmError(vmm::VmmError),
-    #[allow(dead_code)]
     HeapError(heap::HeapError),
 }
 
@@ -49,57 +48,73 @@ pub fn init() -> Result<(), MmError> {
     }
 
     let total_frames = align_up(highest, FRAME_SIZE) >> FRAME_SHIFT;
-    let bitmap_bytes = total_frames.div_ceil(8).next_multiple_of(FRAME_SIZE);
+    let order_bytes = align_up(total_frames, FRAME_SIZE);
 
     println!(
-        "highest phys = {:#x}, frames = {}, bitmap = {} KiB",
+        "highest phys = {:#x}, frames = {}, frame_order = {} KiB",
         highest,
         total_frames,
-        bitmap_bytes / 1024
+        order_bytes / 1024
     );
 
-    let mut bitmap_phys = u64::MAX;
+    let mut order_phys = u64::MAX;
     for entry in memmap {
-        if entry.type_ == MEMMAP_USABLE && entry.length >= bitmap_bytes {
-            bitmap_phys = entry.base;
+        if entry.type_ == MEMMAP_USABLE && entry.length >= order_bytes {
+            order_phys = entry.base;
             break;
         }
     }
     assert!(
-        bitmap_phys != u64::MAX,
-        "no usable region large enough for bitmap"
+        order_phys != u64::MAX,
+        "no usable region large enough for frame_order"
     );
 
-    let mut bitmap = Bitmap::new((bitmap_phys + hhdm_offset) as *mut u8, bitmap_bytes);
-    bitmap.buf.fill(0xFF);
+    let frame_order = unsafe {
+        core::slice::from_raw_parts_mut(
+            (order_phys + hhdm_offset) as *mut u8,
+            total_frames as usize,
+        )
+    };
 
-    let mut free_frames = 0;
+    let mut pmm = Pmm::new(frame_order, total_frames, hhdm_offset);
+
+    let order_first = order_phys >> FRAME_SHIFT;
+    let order_last = order_first + (order_bytes >> FRAME_SHIFT);
+
     for entry in memmap {
         if entry.type_ != MEMMAP_USABLE {
             continue;
         }
-        let first = entry.base >> FRAME_SHIFT;
-        let count = entry.length >> FRAME_SHIFT;
-        bitmap.clear_range(first, count);
-        free_frames += count;
+        let entry_first = entry.base >> FRAME_SHIFT;
+        let entry_last = (entry.base + entry.length) >> FRAME_SHIFT;
+
+        // skip the slice owned by frame_order
+        let pieces = [
+            (entry_first, entry_last.min(order_first)),
+            (entry_first.max(order_last), entry_last),
+        ];
+        for (mut s, e) in pieces {
+            if e <= s {
+                continue;
+            }
+            // never hand out frame 0 (null)
+            if s == 0 {
+                s = 1;
+            }
+            if e > s {
+                pmm.add_range(s, e - s);
+            }
+        }
     }
 
-    let bitmap_first = bitmap_phys >> FRAME_SHIFT;
-    let bitmap_frames = bitmap_bytes.div_ceil(FRAME_SIZE);
-    bitmap.set_range(bitmap_first, bitmap_frames);
-    free_frames -= bitmap_frames;
-
-    if !bitmap.read(0) {
-        bitmap.set(0);
-        free_frames -= 1;
-    }
-
-    PMM.install(Pmm::new(bitmap, total_frames, free_frames));
+    let free = pmm.free_frames_count();
+    pmm::install(pmm);
 
     println!(
-        "free = {} frames ({} MiB)",
-        free_frames,
-        free_frames * FRAME_SIZE / 1024 / 1024
+        "free = {} / {} frames ({} MiB)",
+        free,
+        total_frames,
+        free * FRAME_SIZE / 1024 / 1024
     );
 
     let top_level = vmm::take_ownership(hhdm_offset).map_err(MmError::VmmError)?;

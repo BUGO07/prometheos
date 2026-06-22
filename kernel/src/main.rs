@@ -6,6 +6,7 @@ extern crate alloc;
 use core::arch::asm;
 
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker, request::FramebufferRequest};
+use x86::controlregs::{Cr0, Cr4, cr0, cr0_write, cr4, cr4_write};
 
 mod acpi;
 mod apic;
@@ -40,6 +41,15 @@ extern "C" fn kmain() -> ! {
 
     print!("\x1b[H\x1b[2J"); // clear screen
     println!("booting");
+
+    // enable sse
+    let mut c0 = unsafe { cr0() };
+    c0.remove(Cr0::CR0_EMULATE_COPROCESSOR);
+    c0.insert(Cr0::CR0_MONITOR_COPROCESSOR);
+    unsafe { cr0_write(c0) };
+    let mut c4 = unsafe { cr4() };
+    c4.insert(Cr4::CR4_ENABLE_SSE | Cr4::CR4_UNMASKED_SSE);
+    unsafe { cr4_write(c4) };
 
     mm::init().unwrap();
 

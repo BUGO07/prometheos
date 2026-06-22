@@ -13,7 +13,7 @@ use x86::{
 
 use crate::{
     println,
-    utils::{IntLock, Singleton},
+    utils::{Singleton, SpinLock},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -83,8 +83,8 @@ pub extern "C" fn isr_handler(frame: &mut InterruptFrame) {
 type Handler = Box<dyn FnMut(&mut InterruptFrame) + Send>;
 
 static IDT: Singleton<[Descriptor64; 256]> = Singleton::new();
-static HANDLERS: [Mutex<IntLock, Option<Handler>>; 256] =
-    [const { Mutex::const_new(IntLock::INIT, None) }; 256];
+static HANDLERS: [Mutex<SpinLock, Option<Handler>>; 256] =
+    [const { Mutex::const_new(SpinLock::INIT, None) }; 256];
 
 const DOUBLE_FAULT_IST: u8 = 1;
 
